@@ -13,6 +13,30 @@ class ActiveRecordHostPoolTest < Minitest::Test
     Phenix.burn!
   end
 
+  def test_connection_per_thread_even_when_switching_databases
+    threads = []
+    connections = []
+    databases = []
+
+    3.times do
+      threads << Thread.new do
+        Test1.connection.execute("SELECT 1")
+        connections.push(Test1.connection)
+        databases.push(current_database(Test1))
+
+        Test2.connection.execute("SELECT 1")
+        connections.push(Test2.connection)
+        databases.push(current_database(Test2))
+      end
+    end
+
+    threads.each(&:join)
+
+    assert_equal(3, connections.uniq.size)
+    assert_equal(3, connections.map(&:__getobj__).uniq.size)
+    assert_equal(2, databases.uniq.size)
+  end
+
   def test_process_forking_with_connections
     # Ensure we have a connection already
     assert_equal(true, ActiveRecord::Base.connected?)
