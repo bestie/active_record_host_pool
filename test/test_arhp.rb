@@ -55,59 +55,77 @@ class ActiveRecordHostPoolTest < Minitest::Test
   end
 
   def test_models_with_matching_hosts_should_share_a_connection
-    assert_equal(Test1.connection.raw_connection, Test2.connection.raw_connection)
-    assert_equal(Test3.connection.raw_connection, Test4.connection.raw_connection)
+    run_multiple_times_concurrently do
+      assert_equal(Test1.connection.raw_connection, Test2.connection.raw_connection)
+      assert_equal(Test3.connection.raw_connection, Test4.connection.raw_connection)
+    end
   end
 
   def test_models_without_matching_hosts_should_not_share_a_connection
-    refute_equal(Test1.connection.raw_connection, Test4.connection.raw_connection)
+    run_multiple_times_concurrently do
+      refute_equal(Test1.connection.raw_connection, Test4.connection.raw_connection)
+    end
   end
 
   def test_models_without_matching_usernames_should_not_share_a_connection
-    refute_equal(Test4.connection.raw_connection, Test5.connection.raw_connection)
+    run_multiple_times_concurrently do
+      refute_equal(Test4.connection.raw_connection, Test5.connection.raw_connection)
+    end
   end
 
   def test_models_without_match_slave_status_should_not_share_a_connection
-    refute_equal(Test1.connection.raw_connection, Test1Slave.connection.raw_connection)
+    run_multiple_times_concurrently do
+      refute_equal(Test1.connection.raw_connection, Test1Slave.connection.raw_connection)
+    end
   end
 
   def test_should_select_on_correct_database
-    assert_action_uses_correct_database(:select_all, 'select 1')
+    run_multiple_times_concurrently do
+      assert_action_uses_correct_database(:select_all, 'select 1')
+    end
   end
 
   def test_should_insert_on_correct_database
-    assert_action_uses_correct_database(:insert, "insert into tests values(NULL, 'foo')")
+    run_multiple_times_concurrently do
+      assert_action_uses_correct_database(:insert, "insert into tests values(NULL, 'foo')")
+    end
   end
 
   def test_models_with_matching_hosts_and_non_matching_databases_should_share_a_connection
-    simulate_rails_app_active_record_railties
-    assert_equal(Test1.connection.raw_connection, Test1Shard.connection.raw_connection)
+    run_multiple_times_concurrently do
+      simulate_rails_app_active_record_railties
+      assert_equal(Test1.connection.raw_connection, Test1Shard.connection.raw_connection)
+    end
   end
 
   if ActiveRecord.version >= Gem::Version.new('6.0')
     def test_models_with_matching_hosts_and_non_matching_databases_issue_exists_without_arhp_patch
-      simulate_rails_app_active_record_railties
+      run_multiple_times_concurrently do
+        simulate_rails_app_active_record_railties
 
-      # Remove patch that fixes an issue in Rails 6+ to ensure it still
-      # exists. If this begins to fail then it may mean that Rails has fixed
-      # the issue so that it no longer occurs.
-      without_module_patch(ActiveRecordHostPool::ClearQueryCachePatch, :clear_query_caches_for_current_thread) do
-        exception = assert_raises(ActiveRecord::StatementInvalid) do
-          ActiveRecord::Base.cache { Test1Shard.create! }
+        # Remove patch that fixes an issue in Rails 6+ to ensure it still
+        # exists. If this begins to fail then it may mean that Rails has fixed
+        # the issue so that it no longer occurs.
+        without_module_patch(ActiveRecordHostPool::ClearQueryCachePatch, :clear_query_caches_for_current_thread) do
+          exception = assert_raises(ActiveRecord::StatementInvalid) do
+            ActiveRecord::Base.cache { Test1Shard.create! }
+          end
+
+          assert_equal("Mysql2::Error: Table 'arhp_test_2.test1_shards' doesn't exist", exception.message)
         end
-
-        assert_equal("Mysql2::Error: Table 'arhp_test_2.test1_shards' doesn't exist", exception.message)
       end
     end
 
     def test_models_with_matching_hosts_and_non_matching_databases_do_not_mix_up_underlying_database
-      simulate_rails_app_active_record_railties
+      run_multiple_times_concurrently do
+        simulate_rails_app_active_record_railties
 
-      # ActiveRecord 6.0 introduced a change that surfaced a problematic code
-      # path in active_record_host_pool when clearing caches across connection
-      # handlers which can cause the database to change.
-      # See ActiveRecordHostPool::ClearQueryCachePatch
-      ActiveRecord::Base.cache { Test1Shard.create! }
+        # ActiveRecord 6.0 introduced a change that surfaced a problematic code
+        # path in active_record_host_pool when clearing caches across connection
+        # handlers which can cause the database to change.
+        # See ActiveRecordHostPool::ClearQueryCachePatch
+        ActiveRecord::Base.cache { Test1Shard.create! }
+      end
     end
   end
 
@@ -165,7 +183,7 @@ class ActiveRecordHostPoolTest < Minitest::Test
     assert_kind_of(ActiveRecordHostPool::ConnectionProxy, connection)
     ActiveRecord::Base.connection_pool.checkin(connection)
     c2 = ActiveRecord::Base.connection_pool.checkout
-    assert(c2 == connection)
+    assert_kind_of(ActiveRecordHostPool::ConnectionProxy, c2)
   end
 
   def test_no_switch_when_creating_db
@@ -227,6 +245,23 @@ class ActiveRecordHostPoolTest < Minitest::Test
   end
 
   private
+
+  def run_multiple_times_concurrently(&block)
+    Timeout.timeout(5) do
+      threads = 3.times.map do |_n|
+        Thread.new do
+          Thread.current[:ready] = true
+          sleep
+          block.call
+          ActiveRecord::Base.connection_pool.checkin ActiveRecord::Base.connection
+        end
+      end
+
+      sleep(0.01) until threads.all? { |t| t[:ready] }
+      threads.map(&:wakeup)
+      threads.map(&:join)
+    end
+  end
 
   def assert_action_uses_correct_database(action, sql)
     (1..4).each do |i|
